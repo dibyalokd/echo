@@ -1,0 +1,70 @@
+"""
+MCP Server (standalone HTTP)
+============================
+A Model Context Protocol (MCP) server that exposes two math tools:
+  - add:      adds two numbers
+  - multiply: multiplies two numbers
+
+Built with FastMCP from the official `mcp` Python SDK.
+
+Transport: **Streamable HTTP** (the current MCP standard). This makes the
+server a real, long-running process that listens on a URL endpoint, so
+multiple clients can connect to the SAME running server:
+  - your own Python code (see client.py)
+  - the Roo Code VS Code extension (via the endpoint URL)
+  - Claude Desktop / Claude Code
+
+Endpoint (default):  http://127.0.0.1:8000/mcp
+
+Run standalone (spin it up, leave it running):
+    python server.py                 # 127.0.0.1:8000
+    HOST=0.0.0.0 PORT=9000 python server.py   # override host/port
+
+You can also force stdio instead:
+    TRANSPORT=stdio python server.py
+"""
+
+import os
+
+from mcp.server.fastmcp import FastMCP
+
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "8000"))
+TRANSPORT = os.getenv("TRANSPORT", "streamable-http")  # or "stdio" / "sse"
+
+# host/port are passed via settings; the endpoint path defaults to /mcp
+mcp = FastMCP("math-tools", host=HOST, port=PORT)
+
+
+@mcp.tool()
+def add(a: float, b: float) -> float:
+    """Add two numbers and return the sum.
+
+    Args:
+        a: The first number.
+        b: The second number.
+
+    Returns:
+        The sum of a and b.
+    """
+    return a + b
+
+
+@mcp.tool()
+def multiply(a: float, b: float) -> float:
+    """Multiply two numbers and return the product.
+
+    Args:
+        a: The first number.
+        b: The second number.
+
+    Returns:
+        The product of a and b.
+    """
+    return a * b
+
+
+if __name__ == "__main__":
+    if TRANSPORT == "streamable-http":
+        print(f"math-tools MCP server -> http://{HOST}:{PORT}/mcp", flush=True)
+    mcp.run(transport=TRANSPORT)
