@@ -1,0 +1,290 @@
+"""
+Failure-Log Client
+==================
+Sends test-case failure logs to the standalone MCP server. Two entry points:
+
+    from client import send_log, send_log_file
+
+    # 1) a chunk of log text you already have -> stored as ONE record
+    send_log("BPHNUI001", "NullPointerException at checkout.java:52")
+
+    # 2) an entire log file -> split into TEST-CASE BLOCKS.
+    #    Only FAILED cases are stored; passed cases are discarded.
+    #    The case id is read from the log itself (caseId=...).
+    send_log_file("/var/logs/run_2026-07-22.log")
+
+How a file is parsed
+--------------------
+Blocks are delimited by marker lines, matched by "contains" and case-insensitively,
+so any number of leading/trailing '*' works:
+
+    ***** Start test case  ... {caseId=BPHNUI001, flow=...}   <- opens a block
+    ...log lines...
+    ***** Test failed case ...                                <- FAILED  -> stored
+    ***** Tested ok ...                                       <- PASSED  -> skipped
+
+One failed case = one record, stored whole (no size splitting). The record's
+testcaseId is the caseId parsed from the block.
+
+Notes
+-----
+* The file is read HERE (client side) and its content is sent over MCP, so this
+  works even when the server runs on a different machine.
+* Endpoint defaults to $MCP_URL, else http://127.0.0.1:8000/mcp; override with url=.
+* Failures raise MCPError.
+
+Quick check:
+    python client.py
+"""
+
+import asyncio
+import json
+import os
+import re
+import threading
+from typing import Any, Callable
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+DEFAULT_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+
+# --- Log markers -----------------------------------------------------------
+# Matched with "contains", case-insensitive. Adjust here if your log wording
+# differs; nothing else needs to change.
+MARKER_START = "start test case"
+MARKER_FAIL = "test failed case"
+MARKER_PASS = "tested ok"
+
+# Pulls BPHNUI001 out of "... {caseId=BPHNUI001, flow=...}"
+CASE_ID_RE = re.compile(r"caseid\s*=\s*([A-Za-z0-9_.\-]+)", re.IGNORECASE)
+
+# Safety net so a pathological file can't fire unlimited embed calls.
+DEFAULT_MAX_CASES = 500
+
+# The MCP tool this client writes through (unchanged on the server).
+STORE_TOOL = "store_failure_log"
+
+
+class MCPError(RuntimeError):
+    """Raised when the server is unreachable or a store call fails."""
+
+
+# --------------------------------------------------------------------------
+# Internal: MCP connection (private)
+# --------------------------------------------------------------------------
+def _result_text(result) -> str:
+    parts = [b.text for b in result.content if getattr(b, "type", None) == "text"]
+    return "\n".join(parts) if parts else str(result.content)
+
+
+class _Connection:
+    """Sync wrapper around an MCP session, kept open across many calls."""
+
+    def __init__(self, url: str):
+        self.url = url
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._session: ClientSession | None = None
+        self._streams_cm = None
+        self._session_cm = None
+
+    def __enter__(self) -> "_Connection":
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, name="mcp-log-client", daemon=True
+        )
+        self._thread.start()
+        try:
+            self._run(self._open())
+        except Exception as exc:
+            self._shutdown()
+            raise MCPError(
+                f"Could not connect to MCP server at {self.url}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        return self
+
+    def __exit__(self, *exc) -> None:
+        try:
+            self._run(self._close())
+        except Exception:
+            pass
+        finally:
+            self._shutdown()
+
+    async def _open(self) -> None:
+        self._streams_cm = streamablehttp_client(self.url)
+        read, write, _ = await self._streams_cm.__aenter__()
+        self._session_cm = ClientSession(read, write)
+        self._session = await self._session_cm.__aenter__()
+        await self._session.initialize()
+
+    async def _close(self) -> None:
+        if self._session_cm:
+            await self._session_cm.__aexit__(None, None, None)
+        if self._streams_cm:
+            await self._streams_cm.__aexit__(None, None, None)
+        self._session = None
+
+    def _shutdown(self) -> None:
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._thread:
+                self._thread.join(timeout=5)
+            self._loop.close()
+        self._loop = self._thread = None
+
+    def _run(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    async def _call(self, tool: str, arguments: dict) -> str:
+        result = await self._session.call_tool(tool, arguments)
+        text = _result_text(result)
+        if getattr(result, "isError", False):
+            raise MCPError(f"{tool} failed: {text}")
+        return text
+
+    def store(self, testcase_id: str, log: str) -> Any:
+        try:
+            text = self._run(
+                self._call(STORE_TOOL, {"testcase_id": testcase_id, "log": log})
+            )
+        except MCPError:
+            raise
+        except Exception as exc:
+            raise MCPError(
+                f"storing log for {testcase_id} failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
+
+# --------------------------------------------------------------------------
+# Internal: block parsing
+# --------------------------------------------------------------------------
+def _parse_failed_blocks(text: str) -> tuple[list[tuple[str, str]], dict]:
+    """Split log text into test-case blocks; keep only FAILED ones.
+
+    Returns (blocks, counts) where blocks is [(case_id, block_text), ...].
+    Blocks that never close, or that carry no caseId, are skipped silently.
+    """
+    failed: list[tuple[str, str]] = []
+    counts = {"blocks": 0, "failed": 0, "passed": 0}
+
+    buf: list[str] | None = None  # None = not inside a block
+
+    for line in text.splitlines():
+        low = line.lower()
+
+        if MARKER_START in low:
+            # A new start abandons any unclosed previous block.
+            buf = [line]
+            continue
+
+        if buf is None:
+            continue  # text outside any block
+
+        buf.append(line)
+
+        if MARKER_FAIL in low:
+            counts["blocks"] += 1
+            counts["failed"] += 1
+            block = "\n".join(buf)
+            m = CASE_ID_RE.search(buf[0]) or CASE_ID_RE.search(block)
+            if m:
+                failed.append((m.group(1), block))
+            buf = None
+        elif MARKER_PASS in low:
+            counts["blocks"] += 1
+            counts["passed"] += 1
+            buf = None  # passed -> discard
+
+    return failed, counts
+
+
+# --------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------
+def send_log(testcase_id: str, text: str, url: str | None = None) -> dict:
+    """Send ONE chunk of failure-log text for a test case.
+
+    Args:
+        testcase_id: The test case id (e.g. "BPHNUI001").
+        text: The failure log text.
+        url: Optional MCP endpoint override.
+
+    Returns:
+        The server's record summary (entryId, testcaseId, timestamp, ...).
+    """
+    if not testcase_id or not str(testcase_id).strip():
+        raise ValueError("testcase_id is required")
+    if not text or not text.strip():
+        raise ValueError("text is empty — nothing to store")
+
+    with _Connection(url or DEFAULT_URL) as conn:
+        return conn.store(str(testcase_id).strip(), text)
+
+
+def send_log_file(
+    path: str,
+    url: str | None = None,
+    max_cases: int = DEFAULT_MAX_CASES,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> dict:
+    """Send an ENTIRE log file: one record per FAILED test case.
+
+    The file is parsed into test-case blocks. Failed blocks are stored whole,
+    under the caseId found inside the block. Passed blocks are skipped.
+
+    Args:
+        path: Path to the log file (read on THIS machine).
+        url: Optional MCP endpoint override.
+        max_cases: Safety cap on how many failed cases to store.
+        on_progress: Optional callback(done, total) after each stored case.
+
+    Returns:
+        {"source": ..., "blocks": N, "failed": N, "passed": N,
+         "stored": N, "cases": [ids...]}
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"log file not found: {path}")
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        content = fh.read()
+
+    blocks, counts = _parse_failed_blocks(content)
+    total = len(blocks)
+    if total > max_cases:
+        raise MCPError(
+            f"{os.path.basename(path)} has {total} failed cases (cap is {max_cases}). "
+            f"Raise max_cases= if that's expected."
+        )
+
+    stored: list[str] = []
+    if total:
+        with _Connection(url or DEFAULT_URL) as conn:  # ONE session for the file
+            for i, (case_id, block) in enumerate(blocks, 1):
+                conn.store(case_id, block)
+                stored.append(case_id)
+                if on_progress:
+                    on_progress(i, total)
+
+    return {
+        "source": os.path.basename(path),
+        "blocks": counts["blocks"],
+        "failed": counts["failed"],
+        "passed": counts["passed"],
+        "stored": len(stored),
+        "cases": stored,
+    }
+
+
+# --------------------------------------------------------------------------
+# Quick check: python client.py
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    print(f"MCP endpoint: {DEFAULT_URL}")
+    print("send_log ->", send_log("TC-DEMO", "connectivity check: demo failure line"))
