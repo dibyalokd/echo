@@ -1,0 +1,582 @@
+"""
+Chat Orchestrator (master to the MCP tools)
+===========================================
+FastAPI "brain" in front of the MCP server: routes user messages to MCP tools
+via LM Studio function calling, executes them, and streams the answer + live
+tool activity to the browser over SSE. Serves the console UI (static/index.html).
+
+Run (with the MCP server and LM Studio up):
+    python chat_app.py            # http://127.0.0.1:8080
+
+Environment variables (set LMSTUDIO_BASE_URL once so this matches llm_connect.py):
+    MCP_URL              default http://127.0.0.1:8000/mcp
+    LMSTUDIO_BASE_URL    default http://192.168.1.7:1234/v1
+    LMSTUDIO_CHAT_MODEL  default "mistralai/ministral-3-3b"
+    AGENT_MAX_STEPS      default 6
+"""
+
+import asyncio
+import json
+import os
+import re
+import sqlite3
+import time
+import uuid
+from typing import Any, AsyncIterator
+
+import httpx
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+# --- Configuration -------------------------------------------------------
+MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+# The router/brain does chat only -> point it at the CHAT machine (same env as
+# llm_connect's chat host). The embed machine is tracked only for health checks.
+LMSTUDIO_BASE_URL = os.getenv(
+    "LMSTUDIO_CHAT_BASE_URL",
+    os.getenv("LMSTUDIO_BASE_URL", "http://192.168.1.7:1234/v1"),
+).rstrip("/")
+EMBED_BASE_URL = os.getenv("LMSTUDIO_EMBED_BASE_URL", "http://192.168.1.5:1234/v1").rstrip("/")
+CHAT_MODEL = os.getenv("LMSTUDIO_CHAT_MODEL", "mistralai/ministral-3-3b")
+MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "6"))
+REQUEST_TIMEOUT = float(os.getenv("LMSTUDIO_TIMEOUT", "120"))
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(_HERE, "static")
+DB_PATH = os.getenv("CHAT_DB", os.path.join(_HERE, "chat_history.db"))
+
+app = FastAPI(title="MCP Tools Console")
+
+
+# --- Chat history (SQLite) ----------------------------------------------
+def _db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    """Create the chat-history tables if they don't exist."""
+    with _db() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS conversations (
+                   id         TEXT PRIMARY KEY,
+                   title      TEXT NOT NULL,
+                   created_at REAL NOT NULL,
+                   updated_at REAL NOT NULL
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS messages (
+                   id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                   conversation_id TEXT NOT NULL,
+                   role            TEXT NOT NULL,
+                   content         TEXT NOT NULL,
+                   created_at      REAL NOT NULL,
+                   FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                       ON DELETE CASCADE
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, id)"
+        )
+
+
+init_db()
+
+
+def save_message(conversation_id: str, role: str, content: str) -> None:
+    """Append a message, creating the conversation on first use."""
+    if not conversation_id or not content:
+        return
+    now = time.time()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if row is None:
+            title = " ".join(content.split())[:70] or "New chat"
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at)"
+                " VALUES (?,?,?,?)",
+                (conversation_id, title, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (now, conversation_id),
+            )
+        conn.execute(
+            "INSERT INTO messages (conversation_id, role, content, created_at)"
+            " VALUES (?,?,?,?)",
+            (conversation_id, role, content, now),
+        )
+
+
+# --- Error helper --------------------------------------------------------
+def describe_exc(exc: BaseException) -> str:
+    """Unwrap ExceptionGroup (from async TaskGroups) to the real cause(s)."""
+    parts: list[str] = []
+
+    def walk(e: BaseException) -> None:
+        if isinstance(e, BaseExceptionGroup):
+            for sub in e.exceptions:
+                walk(sub)
+        else:
+            msg = str(e).strip()
+            parts.append(f"{type(e).__name__}: {msg}" if msg else type(e).__name__)
+
+    walk(exc)
+    # de-duplicate while preserving order
+    seen, out = set(), []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return " | ".join(out) if out else f"{type(exc).__name__}: {exc}"
+
+
+# --- MCP helpers ---------------------------------------------------------
+def _tool_text(result) -> str:
+    parts = []
+    for block in result.content:
+        if getattr(block, "type", None) == "text":
+            parts.append(block.text)
+    return "\n".join(parts) if parts else str(result.content)
+
+
+def _to_openai_tools(mcp_tools) -> list[dict]:
+    specs = []
+    for t in mcp_tools:
+        specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": (t.description or "").strip(),
+                    "parameters": t.inputSchema or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return specs
+
+
+def _system_prompt(mcp_tools) -> str:
+    lines = [
+        "You are the orchestrator for a software test FAILURE-log system.",
+        "Every stored record is a test-case failure: it has a testcaseId, the raw",
+        "failure log text, and a backend-generated UTC timestamp. Only failures are",
+        "stored (there is no pass/fail flag). Use the MCP tools instead of guessing.",
+        "",
+        "Routing guidance:",
+        "- To save a new failure the user reports: store_failure_log(testcase_id, log).",
+        "  The user gives the id and log; the timestamp is added automatically.",
+        "- For the past failures of ONE test case (\"history of TC-321\"):",
+        "  get_failure_history(testcase_id).",
+        "- To find failures similar to a description, or to gather related failures",
+        "  for pattern analysis: search_failures(query, n_results, since_days).",
+        "- To scan many recent failures and summarize COMMON patterns across cases:",
+        "  list_recent_failures(limit, since_days), then reason over the logs.",
+        "- Use since_days for time windows (e.g. 30 = last month; 0 = all time).",
+        "",
+        "When answering historical or pattern questions, read the returned log text",
+        "and timestamps and explain what you find (dates, recurring errors, which",
+        "test cases share a failure mode). If asked what you can do, describe the",
+        "tools plainly.",
+        "",
+        "Formatting: reply in Markdown. Put code/logs in fenced code blocks with a",
+        "language tag. Keep answers concise.",
+        "",
+        "Available tools:",
+    ]
+    for t in mcp_tools:
+        desc = (t.description or "").strip().splitlines()
+        lines.append(f"- {t.name}: {desc[0] if desc else ''}")
+    return "\n".join(lines)
+
+
+# --- LM Studio call ------------------------------------------------------
+# =============================================================================
+# ██  ROUTER CONNECTION SWAP POINT  ██
+# -----------------------------------------------------------------------------
+# This is the LLM that DECIDES WHICH TOOL TO CALL (the orchestrator's brain).
+# It is separate from llm_connect.py's chat backend because it additionally
+# needs OpenAI-style TOOL CALLING support.
+#
+# To use your own on-prem server, implement custom_router_connect() below and:
+#     export ROUTER_BACKEND=custom
+#
+# Contract:
+#   custom_router_connect(messages, tools) -> dict
+#     Must return an OpenAI-shaped message dict:
+#         {"content": "...text..."}                      # final answer
+#       or
+#         {"content": None, "tool_calls": [               # wants a tool
+#             {"id": "call_1", "type": "function",
+#              "function": {"name": "...", "arguments": "{\"a\": 1}"}}]}
+#     `arguments` must be a JSON *string*. If your server has no tool-calling,
+#     return only {"content": ...} — the app degrades to plain chat (no routing).
+# =============================================================================
+ROUTER_BACKEND = os.getenv("ROUTER_BACKEND", "lmstudio").lower()
+
+
+async def _lmstudio_router(
+    client: httpx.AsyncClient, messages: list[dict], tools: list[dict]
+) -> dict:
+    """Default router: LM Studio / OpenAI-compatible chat completions."""
+    payload: dict[str, Any] = {"model": CHAT_MODEL, "messages": messages}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    resp = await client.post(f"{LMSTUDIO_BASE_URL}/chat/completions", json=payload)
+    if resp.status_code == 400 and tools:
+        # Some models reject the tools parameter; retry as plain chat.
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        resp = await client.post(f"{LMSTUDIO_BASE_URL}/chat/completions", json=payload)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]
+
+
+async def custom_router_connect(
+    client: httpx.AsyncClient, messages: list[dict], tools: list[dict]
+) -> dict:
+    """PLACEHOLDER — wire your self-hosted ROUTER LLM in here.
+
+    Only use this if your server returns OpenAI-style `tool_calls`. If your
+    connectLLM() returns a plain STRING (no tool_calls), use the "textjson"
+    backend instead: `export ROUTER_BACKEND=textjson` — it prompts the model to
+    emit a JSON tool call and parses it, so routing works over plain text.
+
+        from your_module import connectLLM
+        raw = connectLLM(messages)          # must expose tool_calls
+        return {"content": ..., "tool_calls": [...]}
+    """
+    raise NotImplementedError(
+        "custom_router_connect() is a placeholder. Implement it in chat_app.py, "
+        "or use ROUTER_BACKEND=textjson if your LLM returns plain strings."
+    )
+
+
+# ---- Router for string-only backends (no native tool calling) --------------
+_TEXTJSON_RULES = """
+You can call a tool. To do so, reply with ONLY a JSON object and nothing else:
+{"tool": "<tool_name>", "arguments": {<args>}}
+If you do not need a tool, reply normally in Markdown with your final answer.
+Never wrap the JSON in code fences. Never add text around the JSON.
+"""
+
+
+def _extract_json_obj(text: str):
+    """Pull the first {...} JSON object out of a text reply, if present."""
+    s = text.strip()
+    if s.startswith("```"):  # strip accidental fences
+        s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s).strip()
+    start = s.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(s[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(s[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+async def _textjson_router(
+    client: httpx.AsyncClient, messages: list[dict], tools: list[dict]
+) -> dict:
+    """Route via plain text: ask for a JSON tool call, then parse it.
+
+    Works with any backend that returns a STRING (e.g. your connectLLM()),
+    because it never relies on native tool_calls support.
+    """
+    from llm_connect import chat_connect  # uses CHAT_BACKEND (your connectLLM)
+
+    msgs = list(messages)
+    if tools:
+        catalog = "\n".join(
+            f'- {t["function"]["name"]}: {t["function"].get("description","").splitlines()[0] if t["function"].get("description") else ""}'
+            f'\n  args schema: {json.dumps(t["function"].get("parameters", {}).get("properties", {}))}'
+            for t in tools
+        )
+        # Append the tool protocol to the system message.
+        if msgs and msgs[0].get("role") == "system":
+            msgs[0] = {
+                "role": "system",
+                "content": f'{msgs[0]["content"]}\n\nTOOLS YOU MAY CALL:\n{catalog}\n{_TEXTJSON_RULES}',
+            }
+        else:
+            msgs.insert(0, {"role": "system",
+                            "content": f"TOOLS YOU MAY CALL:\n{catalog}\n{_TEXTJSON_RULES}"})
+
+    # chat_connect is sync; run it off the event loop.
+    text = await asyncio.to_thread(chat_connect, msgs)
+
+    obj = _extract_json_obj(text) if tools else None
+    if isinstance(obj, dict) and obj.get("tool"):
+        return {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": obj["tool"],
+                        "arguments": json.dumps(obj.get("arguments", {})),
+                    },
+                }
+            ],
+        }
+    return {"content": text}
+
+
+ROUTER_BACKENDS = {
+    "lmstudio": _lmstudio_router,
+    "custom": custom_router_connect,
+    "textjson": _textjson_router,
+}
+
+
+async def _lmstudio_chat(
+    client: httpx.AsyncClient, messages: list[dict], tools: list[dict]
+) -> dict:
+    """Single entry point for the router. Routes to the selected backend."""
+    fn = ROUTER_BACKENDS.get(ROUTER_BACKEND)
+    if fn is None:
+        raise ValueError(
+            f"Unknown ROUTER_BACKEND '{ROUTER_BACKEND}'. Options: {sorted(ROUTER_BACKENDS)}"
+        )
+    msg = await fn(client, messages, tools)
+    return {"choices": [{"message": msg}]}
+
+# =============================================================================
+# ██  END ROUTER SWAP POINT  ██
+# =============================================================================
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _chunk(text: str, size: int = 24) -> list[str]:
+    return [text[i : i + size] for i in range(0, len(text), size)] or [""]
+
+
+# --- Agent loop (the master) ---------------------------------------------
+async def run_agent(history: list[dict], conversation_id: str = "") -> AsyncIterator[str]:
+    # Persist the incoming user message before we start working.
+    if conversation_id and history:
+        last = history[-1]
+        if last.get("role") == "user":
+            save_message(conversation_id, "user", last.get("content", ""))
+    try:
+        async with streamablehttp_client(MCP_URL) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                mcp_tools = (await session.list_tools()).tools
+                tool_specs = _to_openai_tools(mcp_tools)
+
+                messages = [{"role": "system", "content": _system_prompt(mcp_tools)}]
+                messages.extend(history)
+
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                    for _ in range(MAX_STEPS):
+                        # --- LM Studio (the router/brain) ---
+                        try:
+                            data = await _lmstudio_chat(client, messages, tool_specs)
+                        except Exception as e:
+                            yield _sse("error", {
+                                "message": f"LM Studio request failed at {LMSTUDIO_BASE_URL}: "
+                                           f"{describe_exc(e)}"
+                            })
+                            return
+
+                        msg = data["choices"][0]["message"]
+                        tool_calls = msg.get("tool_calls")
+
+                        if tool_calls:
+                            messages.append({
+                                "role": "assistant",
+                                "content": msg.get("content"),
+                                "tool_calls": tool_calls,
+                            })
+                            for tc in tool_calls:
+                                name = tc["function"]["name"]
+                                raw_args = tc["function"].get("arguments") or "{}"
+                                try:
+                                    args = json.loads(raw_args)
+                                except json.JSONDecodeError:
+                                    args = {}
+                                yield _sse("tool_call", {"name": name, "arguments": args})
+
+                                # --- MCP tool execution ---
+                                try:
+                                    result = await session.call_tool(name, args)
+                                    text = _tool_text(result)
+                                except Exception as e:
+                                    text = f"[tool error] {describe_exc(e)}"
+                                yield _sse("tool_result", {"name": name, "result": text})
+
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": text,
+                                })
+                            continue
+
+                        content = msg.get("content") or ""
+                        for piece in _chunk(content):
+                            yield _sse("token", {"text": piece})
+                        if conversation_id:
+                            save_message(conversation_id, "assistant", content)
+                        yield _sse("done", {})
+                        return
+
+                    yield _sse("error", {
+                        "message": f"Stopped after {MAX_STEPS} steps without a final answer."
+                    })
+    except Exception as exc:
+        yield _sse("error", {
+            "message": f"MCP connection failed at {MCP_URL}: {describe_exc(exc)}"
+        })
+
+
+# --- Routes --------------------------------------------------------------
+class ChatRequest(BaseModel):
+    messages: list[dict]
+    conversation_id: str = ""
+
+
+@app.get("/api/conversations")
+async def list_conversations(limit: int = 100) -> dict:
+    """List saved chats, most recently updated first."""
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT c.id, c.title, c.updated_at,
+                      (SELECT COUNT(*) FROM messages m
+                        WHERE m.conversation_id = c.id) AS message_count
+                 FROM conversations c
+                ORDER BY c.updated_at DESC
+                LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return {"conversations": [dict(r) for r in rows]}
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str) -> dict:
+    """Return every message of one saved chat, in order."""
+    with _db() as conn:
+        conv = conn.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT role, content, created_at FROM messages"
+            " WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
+    if conv is None:
+        return {"error": "not found", "messages": []}
+    return {"conversation": dict(conv), "messages": [dict(r) for r in rows]}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str) -> dict:
+    """Delete a saved chat and its messages."""
+    with _db() as conn:
+        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+    return {"deleted": conversation_id}
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    status = {
+        "mcp": False, "chat_llm": False, "embed_llm": False,
+        "model": CHAT_MODEL,
+        "router_backend": ROUTER_BACKEND,
+        "mcp_url": MCP_URL,
+        "chat_url": LMSTUDIO_BASE_URL,
+        "embed_url": EMBED_BASE_URL,
+    }
+    try:
+        async with streamablehttp_client(MCP_URL) as (r, w, _):
+            async with ClientSession(r, w) as s:
+                await s.initialize()
+                await s.list_tools()
+                status["mcp"] = True
+    except Exception as e:
+        status["mcp_error"] = describe_exc(e)
+    # chat machine
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{LMSTUDIO_BASE_URL}/models")
+            status["chat_llm"] = r.status_code == 200
+    except Exception as e:
+        status["chat_error"] = describe_exc(e)
+    # embed machine (separate host)
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{EMBED_BASE_URL}/models")
+            status["embed_llm"] = r.status_code == 200
+    except Exception as e:
+        status["embed_error"] = describe_exc(e)
+    return status
+
+
+@app.get("/api/tools")
+async def tools() -> dict:
+    try:
+        async with streamablehttp_client(MCP_URL) as (r, w, _):
+            async with ClientSession(r, w) as s:
+                await s.initialize()
+                mcp_tools = (await s.list_tools()).tools
+                out = []
+                for t in mcp_tools:
+                    schema = t.inputSchema or {}
+                    props = list((schema.get("properties") or {}).keys())
+                    out.append({
+                        "name": t.name,
+                        "description": (t.description or "").strip().splitlines()[0]
+                        if t.description else "",
+                        "params": props,
+                    })
+                return {"tools": out}
+    except Exception as exc:
+        return {"tools": [], "error": describe_exc(exc)}
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest) -> StreamingResponse:
+    return StreamingResponse(
+        run_agent(req.messages, req.conversation_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8080)
