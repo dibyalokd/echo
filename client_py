@@ -1,0 +1,56 @@
+"""
+MCP Client (connects to the standalone HTTP server)
+===================================================
+Connects to an ALREADY-RUNNING server.py over its HTTP endpoint, performs the
+MCP handshake, lists the tools, and calls `add` and `multiply`.
+
+Prerequisite: start the server first, in another terminal:
+    python server.py
+
+Then run:
+    python client.py
+    MCP_URL=http://127.0.0.1:9000/mcp python client.py   # custom endpoint
+"""
+
+import asyncio
+import os
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+# The endpoint of the standalone server. Point this anywhere the server runs.
+MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+
+
+def _extract_text(result) -> str:
+    """Pull the plain-text payload out of a tool-call result."""
+    for block in result.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return str(result.content)
+
+
+async def main() -> None:
+    # Connect to the running server over Streamable HTTP.
+    async with streamablehttp_client(MCP_URL) as (read, write, _get_session_id):
+        async with ClientSession(read, write) as session:
+            await session.initialize()  # MCP handshake
+
+            # 1) Discover the server's tools.
+            tools = await session.list_tools()
+            print(f"Connected to {MCP_URL}")
+            print("Available tools:")
+            for tool in tools.tools:
+                print(f"  - {tool.name}: {tool.description.splitlines()[0]}")
+            print()
+
+            # 2) Call the tools.
+            add_result = await session.call_tool("add", {"a": 7, "b": 5})
+            print(f"add(7, 5)      = {_extract_text(add_result)}")
+
+            mul_result = await session.call_tool("multiply", {"a": 6, "b": 4})
+            print(f"multiply(6, 4) = {_extract_text(mul_result)}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
