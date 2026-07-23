@@ -28,6 +28,14 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
+from llm_connect import (
+    query_llm,
+    store_failure_log as _store_failure_log,
+    get_failure_history as _get_failure_history,
+    search_failures as _search_failures,
+    list_recent_failures as _list_recent_failures,
+)
+
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
 TRANSPORT = os.getenv("TRANSPORT", "streamable-http")  # or "stdio" / "sse"
@@ -62,6 +70,97 @@ def multiply(a: float, b: float) -> float:
         The product of a and b.
     """
     return a * b
+
+
+@mcp.tool()
+def llm_generate(
+    prompt: str,
+    image_path: str | None = None,
+    image_base64: str | None = None,
+) -> str:
+    """Send a prompt to the local LM Studio model, optionally with an image.
+
+    If no image is provided, only the text prompt is sent.
+
+    Args:
+        prompt: The text prompt / question.
+        image_path: Optional path to a local image file (for vision models).
+        image_base64: Optional base64-encoded image (raw or data-URI).
+
+    Returns:
+        The model's text response.
+    """
+    return query_llm(prompt, image_path=image_path, image_base64=image_base64)
+
+
+@mcp.tool()
+def store_failure_log(testcase_id: str, log: str) -> dict:
+    """Store a test-case FAILURE log. A UTC timestamp is added automatically.
+
+    Only failure logs are stored. Each call adds a new entry, so a test case's
+    failures accumulate over time (nothing is overwritten).
+
+    Args:
+        testcase_id: The test case id this failure belongs to.
+        log: The raw failure log text.
+
+    Returns:
+        The generated entry id, testcaseId, timestamp, and vector dimensions.
+    """
+    return _store_failure_log(testcase_id, log)
+
+
+@mcp.tool()
+def get_failure_history(testcase_id: str, limit: int = 50) -> dict:
+    """Get the full failure history for one test case, oldest to newest.
+
+    Use this when the user asks about the past failures of a specific test case
+    id (e.g. "show me the history for TC-321").
+
+    Args:
+        testcase_id: The test case id to look up.
+        limit: Maximum number of past failures to return.
+
+    Returns:
+        A chronological list of that test case's failures (log text + timestamp).
+    """
+    return _get_failure_history(testcase_id, limit)
+
+
+@mcp.tool()
+def search_failures(query: str, n_results: int = 10, since_days: float = 0) -> dict:
+    """Semantically search failure logs across ALL test cases.
+
+    Use this to find failures similar to a description, or to gather related
+    failures when looking for common patterns. Set `since_days` > 0 to restrict
+    to recent failures (e.g. 30 for the last month); 0 means all time.
+
+    Args:
+        query: What to search for (e.g. "payment gateway timeout").
+        n_results: How many matching failures to return.
+        since_days: Only include failures from the last N days (0 = all time).
+
+    Returns:
+        Matching failures with testcaseId, timestamp, log text, and distance.
+    """
+    return _search_failures(query, n_results, since_days or None)
+
+
+@mcp.tool()
+def list_recent_failures(limit: int = 50, since_days: float = 0) -> dict:
+    """List recent failure logs across all test cases (newest first).
+
+    Use this to scan many failures at once to identify common patterns. Set
+    `since_days` > 0 to restrict to a recent window (0 = all time).
+
+    Args:
+        limit: Maximum number of failures to return.
+        since_days: Only include failures from the last N days (0 = all time).
+
+    Returns:
+        A list of recent failures (testcaseId, timestamp, log text).
+    """
+    return _list_recent_failures(limit, since_days or None)
 
 
 if __name__ == "__main__":
