@@ -1,0 +1,377 @@
+"""
+LLM Connect + Failure-Log Vector Store
+======================================
+Talks to two locally hosted **LM Studio** endpoints (OpenAI-compatible):
+  - CHAT_BASE_URL  : chat / vision model  (machine A)
+  - EMBED_BASE_URL : embedding model      (machine B)
+
+and stores software test **failure logs** in ChromaDB for historical analysis.
+
+Storage model (one row PER failure, so history accumulates):
+    ids        -> unique entry id  ("{testcaseId}::{random}")
+    embeddings -> vector of the failure log (for similarity search)
+    documents  -> the raw failure log text (so the model can read it back)
+    metadatas  -> { testcaseId, timestamp (UTC ISO), created_at (epoch) }
+
+The user supplies testcaseId + the failure log. The timestamp is added by the
+backend automatically — it is not the user's responsibility. Only FAILURE logs
+are stored (there is no pass/fail field; every record is a failure).
+
+Environment variables:
+    LMSTUDIO_CHAT_BASE_URL   default http://192.168.1.7:1234/v1   (fallback LMSTUDIO_BASE_URL)
+    LMSTUDIO_EMBED_BASE_URL  default http://192.168.1.5:1234/v1
+    LMSTUDIO_CHAT_MODEL      default "mistralai/ministral-3-3b"
+    LMSTUDIO_EMBED_MODEL     default "text-embedding-nomic-embed-text-v1.5"
+    CHROMA_COLLECTION        default "failure_logs"
+"""
+
+import base64
+import datetime
+import mimetypes
+import os
+import uuid
+
+import chromadb
+import httpx
+
+# Two separate LM Studio endpoints (two machines).
+CHAT_BASE_URL = os.getenv(
+    "LMSTUDIO_CHAT_BASE_URL",
+    os.getenv("LMSTUDIO_BASE_URL", "http://192.168.1.7:1234/v1"),
+).rstrip("/")
+EMBED_BASE_URL = os.getenv("LMSTUDIO_EMBED_BASE_URL", "http://192.168.1.5:1234/v1").rstrip("/")
+CHAT_MODEL = os.getenv("LMSTUDIO_CHAT_MODEL", "mistralai/ministral-3-3b")
+EMBED_MODEL = os.getenv("LMSTUDIO_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5")
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "failure_logs")
+REQUEST_TIMEOUT = float(os.getenv("LMSTUDIO_TIMEOUT", "120"))
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(_HERE, "chroma_db"))
+
+_chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+_collection = _chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+
+
+# --- helpers -------------------------------------------------------------
+def _now():
+    """Return (iso_utc_string, epoch_seconds) for the current UTC time."""
+    dt = datetime.datetime.now(datetime.timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z"), dt.timestamp()
+
+
+def _time_where(since_days):
+    """Chroma `where` clause for 'within the last N days', or None."""
+    if not since_days:
+        return None
+    cutoff = (
+        datetime.datetime.now(datetime.timezone.utc)
+        - datetime.timedelta(days=float(since_days))
+    ).timestamp()
+    return {"created_at": {"$gte": cutoff}}
+
+
+# =============================================================================
+# ██  CONNECTION SWAP POINT  ██
+# -----------------------------------------------------------------------------
+# Everything that TALKS TO A MODEL lives in this block. To use your own on-prem
+# LLM / embedding servers, implement the two `custom_*` functions below and set:
+#
+#     export CHAT_BACKEND=custom
+#     export EMBED_BACKEND=custom
+#
+# Nothing else in this file (or in server.py / chat_app.py) needs to change —
+# the rest of the app only calls chat_connect() and embed_connect().
+#
+# Contract each backend MUST honour:
+#   chat_connect(messages)  -> str          (the assistant's reply text)
+#         `messages` is OpenAI-style: [{"role": "user", "content": <str|list>}]
+#         `content` is a plain string for text, or a list of parts for vision:
+#             [{"type":"text","text":...},
+#              {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]
+#   embed_connect(text)     -> list[float]  (the embedding vector)
+# =============================================================================
+
+# ---- Backend 1: LM Studio (default, OpenAI-compatible HTTP) -----------------
+def _lmstudio_chat(messages: list[dict]) -> str:
+    resp = httpx.post(
+        f"{CHAT_BASE_URL}/chat/completions",
+        json={"model": CHAT_MODEL, "messages": messages},
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _lmstudio_embed(text: str) -> list[float]:
+    resp = httpx.post(
+        f"{EMBED_BASE_URL}/embeddings",
+        json={"model": EMBED_MODEL, "input": text},
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+
+# ---- Adapters between this app's shapes and YOUR function signatures -------
+def _messages_to_prompt(messages: list[dict]) -> str:
+    """Flatten OpenAI-style messages into a single prompt string.
+
+    Your connectLLM() takes a prompt, not a messages list, so this collapses
+    the conversation into text. Image parts are noted but not inlined — pass
+    images through your own API if connectLLM() supports them.
+    """
+    out = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content")
+        if isinstance(content, list):  # multimodal parts
+            text = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+            if any(p.get("type") == "image_url" for p in content):
+                text += "\n[an image was attached]"
+        else:
+            text = content or ""
+        out.append(text if role == "user" and len(messages) == 1 else f"{role}: {text}")
+    return "\n\n".join(out).strip()
+
+
+def _normalize_vector(v) -> list[float]:
+    """Coerce an embedding result into ONE flat list of floats.
+
+    Your connectEmbedLLM() returns a list of vectors, so if we get a batch
+    (e.g. [[0.1, 0.2, ...]]) take the first vector. ChromaDB needs a flat list.
+    """
+    if v and isinstance(v[0], (list, tuple)):
+        v = v[0]
+    return [float(x) for x in v]
+
+
+# ---- Backend 2: YOUR on-prem servers  <<<< PUT YOUR CODE HERE >>>> ----------
+def custom_chat_connect(messages: list[dict]) -> str:
+    """Wire your self-hosted CHAT server in here via connectLLM().
+
+    connectLLM() already parses/joins the model response and returns a string,
+    which is exactly what this function must return — so the wiring is:
+
+        from your_module import connectLLM            # <-- your import
+        return connectLLM(_messages_to_prompt(messages))
+
+    Uncomment the two lines below (and fix the import path) to activate.
+    If connectLLM() accepts a messages list rather than a prompt string, pass
+    `messages` straight through instead of calling _messages_to_prompt().
+    """
+    # from your_module import connectLLM
+    # return connectLLM(_messages_to_prompt(messages))
+    raise NotImplementedError(
+        "custom_chat_connect() is a placeholder. Wire connectLLM() in here "
+        "(llm_connect.py), or unset CHAT_BACKEND=custom to use LM Studio."
+    )
+
+
+def custom_embed_connect(text: str) -> list[float]:
+    """Wire your self-hosted EMBEDDING server in here via connectEmbedLLM().
+
+    connectEmbedLLM() returns a list of vectors; ChromaDB needs a single flat
+    vector, so pass the result through _normalize_vector():
+
+        from your_module import connectEmbedLLM       # <-- your import
+        return _normalize_vector(connectEmbedLLM(text))
+
+    Uncomment the two lines below (and fix the import path) to activate.
+    Keep the dimension consistent — ChromaDB rejects mixed-size vectors in one
+    collection, so changing embedding models means re-indexing chroma_db/.
+    """
+    # from your_module import connectEmbedLLM
+    # return _normalize_vector(connectEmbedLLM(text))
+    raise NotImplementedError(
+        "custom_embed_connect() is a placeholder. Wire connectEmbedLLM() in here "
+        "(llm_connect.py), or unset EMBED_BACKEND=custom to use LM Studio."
+    )
+
+
+# ---- Backend selection (env-driven; add your own entries to the maps) -------
+CHAT_BACKEND = os.getenv("CHAT_BACKEND", "lmstudio").lower()
+EMBED_BACKEND = os.getenv("EMBED_BACKEND", "lmstudio").lower()
+
+CHAT_BACKENDS = {
+    "lmstudio": _lmstudio_chat,
+    "custom": custom_chat_connect,
+}
+EMBED_BACKENDS = {
+    "lmstudio": _lmstudio_embed,
+    "custom": custom_embed_connect,
+}
+
+
+def chat_connect(messages: list[dict]) -> str:
+    """Single entry point for ALL chat calls. Routes to the selected backend."""
+    fn = CHAT_BACKENDS.get(CHAT_BACKEND)
+    if fn is None:
+        raise ValueError(
+            f"Unknown CHAT_BACKEND '{CHAT_BACKEND}'. "
+            f"Options: {sorted(CHAT_BACKENDS)}"
+        )
+    return fn(messages)
+
+
+def embed_connect(text: str) -> list[float]:
+    """Single entry point for ALL embedding calls. Routes to the selected backend."""
+    fn = EMBED_BACKENDS.get(EMBED_BACKEND)
+    if fn is None:
+        raise ValueError(
+            f"Unknown EMBED_BACKEND '{EMBED_BACKEND}'. "
+            f"Options: {sorted(EMBED_BACKENDS)}"
+        )
+    return fn(text)
+
+
+def backend_info() -> dict:
+    """Which backends/models/endpoints are currently in use (for health checks)."""
+    return {
+        "chat_backend": CHAT_BACKEND,
+        "embed_backend": EMBED_BACKEND,
+        "chat_url": CHAT_BASE_URL if CHAT_BACKEND == "lmstudio" else "(custom)",
+        "embed_url": EMBED_BASE_URL if EMBED_BACKEND == "lmstudio" else "(custom)",
+        "chat_model": CHAT_MODEL,
+        "embed_model": EMBED_MODEL,
+    }
+
+# =============================================================================
+# ██  END CONNECTION SWAP POINT — code below is backend-agnostic  ██
+# =============================================================================
+
+
+# --- Internal helpers ----------------------------------------------------
+def _embed(text: str) -> list[float]:
+    """Return the embedding vector for `text` via the selected embed backend."""
+    return embed_connect(text)
+
+
+def _encode_image(image_path: str | None, image_base64: str | None):
+    if image_base64:
+        if image_base64.startswith("data:"):
+            header, _, payload = image_base64.partition(",")
+            mime = header[5:].split(";")[0] or "image/png"
+            return mime, payload
+        return "image/png", image_base64
+    if image_path:
+        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+        with open(image_path, "rb") as fh:
+            return mime, base64.b64encode(fh.read()).decode("utf-8")
+    return None
+
+
+# --- Chat (backend-agnostic) ---------------------------------------------
+def query_llm(prompt, image_path=None, image_base64=None) -> str:
+    """Send a prompt (and optionally an image) to the selected chat backend.
+
+    Builds the OpenAI-style message and hands it to chat_connect(), so this
+    works unchanged whether you're on LM Studio or your own on-prem server.
+    """
+    image = _encode_image(image_path, image_base64)
+    if image is None:
+        content: object = prompt
+    else:
+        mime, b64 = image
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ]
+    return chat_connect([{"role": "user", "content": content}])
+
+
+# --- Failure-log storage + history --------------------------------------
+def store_failure_log(testcase_id: str, log: str) -> dict:
+    """Store one FAILURE log for a test case, with an automatic timestamp.
+
+    Each call adds a NEW entry (history accumulates; nothing is overwritten).
+    """
+    vector = _embed(log)
+    ts_iso, ts_epoch = _now()
+    entry_id = f"{testcase_id}::{uuid.uuid4().hex[:12]}"
+    _collection.add(
+        ids=[entry_id],
+        embeddings=[vector],
+        documents=[log],
+        metadatas=[{"testcaseId": testcase_id, "timestamp": ts_iso, "created_at": ts_epoch}],
+    )
+    return {
+        "entryId": entry_id,
+        "testcaseId": testcase_id,
+        "timestamp": ts_iso,
+        "dimensions": len(vector),
+        "stored": True,
+    }
+
+
+def get_failure_history(testcase_id: str, limit: int = 50) -> dict:
+    """Return all stored failure logs for one testcaseId, oldest to newest."""
+    got = _collection.get(
+        where={"testcaseId": testcase_id},
+        include=["documents", "metadatas"],
+        limit=limit,
+    )
+    entries = [
+        {
+            "testcaseId": testcase_id,
+            "timestamp": meta.get("timestamp"),
+            "created_at": meta.get("created_at"),
+            "log": doc,
+        }
+        for doc, meta in zip(got["documents"], got["metadatas"])
+    ]
+    entries.sort(key=lambda e: e.get("created_at") or 0)
+    return {"testcaseId": testcase_id, "count": len(entries), "history": entries}
+
+
+def search_failures(query: str, n_results: int = 10, since_days: float | None = None) -> dict:
+    """Semantically search failure logs across ALL test cases.
+
+    Returns matching logs with their testcaseId and timestamp. Optionally limit
+    to failures from the last `since_days` days.
+    """
+    count = _collection.count()
+    if count == 0:
+        return {"query": query, "matches": [], "note": "no failures stored"}
+    vector = _embed(query)
+    res = _collection.query(
+        query_embeddings=[vector],
+        n_results=min(n_results, count),
+        where=_time_where(since_days),
+        include=["documents", "metadatas", "distances"],
+    )
+    matches = [
+        {
+            "testcaseId": meta.get("testcaseId"),
+            "timestamp": meta.get("timestamp"),
+            "log": doc,
+            "distance": dist,
+        }
+        for doc, meta, dist in zip(
+            res["documents"][0], res["metadatas"][0], res["distances"][0]
+        )
+    ]
+    return {"query": query, "matches": matches}
+
+
+def list_recent_failures(limit: int = 50, since_days: float | None = None) -> dict:
+    """List recent failure logs across all test cases (newest first).
+
+    Useful for scanning many failures to spot common patterns. Optionally limit
+    to the last `since_days` days.
+    """
+    got = _collection.get(
+        where=_time_where(since_days),
+        include=["documents", "metadatas"],
+        limit=limit,
+    )
+    entries = [
+        {
+            "testcaseId": meta.get("testcaseId"),
+            "timestamp": meta.get("timestamp"),
+            "created_at": meta.get("created_at"),
+            "log": doc,
+        }
+        for doc, meta in zip(got["documents"], got["metadatas"])
+    ]
+    entries.sort(key=lambda e: e.get("created_at") or 0, reverse=True)
+    return {"count": len(entries), "failures": entries}
